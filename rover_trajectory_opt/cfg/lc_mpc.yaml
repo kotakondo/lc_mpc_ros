@@ -1,14 +1,24 @@
 trajectory_generator:
   rover: 'RR01'
-  dt: .02
+  dt: .01 # [s] timestep
   num_timesteps: 100
-  goal_states: [-1.0, 0.0, 0.0, 0.0]
-  x_bounds: [[-10.0, 10], [-10.0, 10.0], [-1.0, 1.0], [-inf, inf]]
-  u_bounds: [[-1.0, 1.0], [-0.785, 0.785]]
-  terminal_cost_weight: 1.0
+  x_bounds: [[-30.0, 30.0], [-30.0, 30.0], [-1.0, 1.0], [-inf, inf]] # [x, y, v, theta]
+  u_bounds: [[-1.0, 1.0], [-0.3925, 0.3925]] # [vdot, thetadot]
+  terminal_cost_weight: 10.0
   waypoints_cost_weight: 1.0
+  Qf: [[1.0, 0.0, 0.0, 0.0], # [x, y, v, theta]
+      [0.0, 1.0, 0.0, 0.0],
+      [0.0, 0.0, 1.0, 0.0],
+      [0.0, 0.0, 0.0, 1.0]]
+  R: [[1.0, 0.0], # [vdot, thetadot]
+      [0.0, 1.0]]
   input_cost_weight: 1.0
   travel_cost_weight: 1.0
   travel_dist_cost_weight: 0.001
   input_rate_cost_weight: 1.0 
   collision_cost_weight: 1.0
+  replan_lookahead_timestep: 30 # how many timesteps to look ahead to set x0 when replanning
+  goal_radius: 0.3 # [m] radius around goal to consider goal reached
+ros:
+  goal_topic: '/move_base/current_goal'
+  costmap_topic: '/move_base/global_costmap/costmap'

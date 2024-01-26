@@ -7,6 +7,7 @@
 import rospy
 import tf2_ros
 from geometry_msgs.msg import PoseStamped, TwistStamped, Twist
+from nav_msgs.msg import OccupancyGrid
 from std_srvs.srv import Trigger
 from rover_trajectory_msgs.msg import RoverState
 
@@ -41,8 +42,9 @@ class TrajectoryGeneratorNode():
         self.rover = rospy.get_param("~trajectory_generator/rover")           # rover names
         self.dt = rospy.get_param("~trajectory_generator/dt")                   # how often to publish trajectory
         self.num_timesteps = rospy.get_param("~trajectory_generator/num_timesteps")  # number of timesteps to use in trajectory optimization
-        self.goal_states = np.array(rospy.get_param(f"~trajectory_generator/goal_states")) # dictionary mapping rover names to goal states
-        
+        self.replan_lookahead_timestep = rospy.get_param("~trajectory_generator/replan_lookahead_timestep") # how many timesteps to look ahead when replanning
+        self.goal_radius = rospy.get_param("~trajectory_generator/goal_radius") # radius around goal to consider goal reached
+
         x_bounds = np.array(rospy.get_param(f"~trajectory_generator/x_bounds")) # state boundaries
         u_bounds = np.array(rospy.get_param(f"~trajectory_generator/u_bounds")) # input boundaries
         # reformatting boundaries for input into tomma
@@ -55,6 +57,8 @@ class TrajectoryGeneratorNode():
             for j in range(self.u_bounds.shape[1]):
                 self.u_bounds[i,j] = float(u_bounds[i,j])
         
+        self.Qf = np.array(rospy.get_param(f"~trajectory_generator/Qf")) # terminal cost matrix
+        self.R = np.array(rospy.get_param(f"~trajectory_generator/R")) # input cost matrix
         self.terminal_cost_weight = rospy.get_param("~trajectory_generator/terminal_cost_weight") # terminal cost weight
         self.waypoints_cost_weight = rospy.get_param("~trajectory_generator/waypoints_cost_weight") # waypoints cost weight
         self.input_cost_weight = rospy.get_param("~trajectory_generator/input_cost_weight") # input cost weight
@@ -63,9 +67,27 @@ class TrajectoryGeneratorNode():
         self.input_rate_cost_weight = rospy.get_param("~trajectory_generator/input_rate_cost_weight") # input rate cost weight
         self.collision_cost_weight = rospy.get_param("~trajectory_generator/collision_cost_weight") # collision cost weight
 
+        # Planner mode
+        self.NOPLAN = 0
+        self.REPLAN = 1
+        self.mode = self.REPLAN
+
+        # ROS params
+        self.goal_topic = rospy.get_param("~ros/goal_topic") # topic to subscribe to for goal states
+        self.costmap_topic = rospy.get_param("~ros/costmap_topic") # topic to subscribe to for costmap
+
         # Internal variables
         self.states = np.nan*np.ones(4)
         self.prev_states = np.nan*np.ones(4)
+        self.goal_states = None
+        self.u_traj = None
+        self.x_traj = None
+        self.t_traj = None
+        self.tf = None
+        self.plan_dt = None
+        self.t_initialized = False
+        self.start_time = None
+        self.t = 0.0
         
         # Trajectory planner
         dubins = DubinsDynamics(control=CONTROL_LIN_ACC_ANG_VEL)
@@ -76,24 +98,40 @@ class TrajectoryGeneratorNode():
                                            travel_dist_cost_weight=self.travel_dist_cost_weight, input_rate_cost_weight=self.input_rate_cost_weight, 
                                            collision_cost_weight=self.collision_cost_weight)
 
-        # Trajectory variables
-        self.traj_planned = False
-        self.t = 0.0
-        
-        # Pub & Sub
+        # Subscribers
         # get rover pose from tf
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
         self.sub_pose = rospy.Timer(rospy.Duration(self.dt), self.pose_cb_tf, oneshot=False) 
         self.sub_twist = rospy.Timer(rospy.Duration(self.dt), self.twist_cb, oneshot=False)
-        
+        self.sub_goal_states = rospy.Subscriber(self.goal_topic, PoseStamped, self.goal_states_cb)
+        self.sub_costmap = rospy.Subscriber(self.costmap_topic, OccupancyGrid, self.planner.update_costmap)
+
+        # Publishers
         # cmd_vel publisher for each rover
         self.pub_cmd_vel = rospy.Publisher(f"/cmd_vel", Twist, queue_size=1)
 
         # timers
         self.replaned = False
         self.replan_timer = rospy.Timer(rospy.Duration(self.dt), self.replan_cb)
+        self.goal_reached_timer = rospy.Timer(rospy.Duration(1.0), self.check_plan_reached_goal)
             
+    def goal_states_cb(self, msg):
+        """
+        Updates goal states
+        """
+
+        # if current plan has not reached goal, do not update goal states
+        if self.mode != self.REPLAN and self.goal_states is not None:
+            return
+
+        print("new goal received")
+        x = msg.pose.position.x 
+        y = msg.pose.position.y
+        v = 0.0
+        theta = Rot.from_quat([msg.pose.orientation.x, msg.pose.orientation.y, msg.pose.orientation.z, msg.pose.orientation.w]).as_euler('xyz')[2]
+        self.goal_states = np.array([x, y, v, theta])
+
     def cmd_vel_cb(self, event):
         """
         Loops every self.dt seconds to publish trajectory to listening robots
@@ -101,51 +139,41 @@ class TrajectoryGeneratorNode():
         Args:
             event (rospy.TimerEvent): not used
         """
+
+        if not self.t_initialized:
+            self.t = 0.0
+            self.start_time = rospy.get_time()
+            self.t_initialized = True
+
         # if trajectory has been planned, publish trajectory
-        if self.traj_planned:
+        if self.u_traj is not None and self.x_traj is not None:
 
             # if trajectory is empty, send zero command
-            if self.u_traj.shape[1] == 0:
+            if self.t >= self.tf:
+                print("t >= tf")
                 cmd_vel = Twist()
-                cmd_vel.linear.x, cmd_vel.linear.y, cmd_vel.linear.z = 0.0, 0.0, 0.0
-                cmd_vel.angular.x, cmd_vel.angular.y, cmd_vel.angular.z = 0.0, 0.0, 0.0
+                cmd_vel.linear.x, cmd_vel.linear.y, cmd_vel.angular.z = 0.0, 0.0, 0.0
                 self.pub_cmd_vel.publish(cmd_vel)
                 return
             
-            # publish cmd_vel
+            # publish cmd_vel 
             cmd_vel = Twist()
-            
-            # extract linear and angular velocities from trajectory
-            x = self.x_traj[0,0] 
-            y = self.x_traj[1,0]
-            v = self.x_traj[2,0]
-            theta = self.x_traj[3,0]
-            vdot = self.u_traj[0,0]
-            thetadot = self.u_traj[1,0]
-            vx = v*np.cos(theta)
-            vy = v*np.sin(theta)
-
-            cmd_vel.linear.x = vx
-            cmd_vel.linear.y = vy
-            cmd_vel.linear.z = 0.0
-            cmd_vel.angular.x = 0.0
-            cmd_vel.angular.y = 0.0
-            cmd_vel.angular.z = thetadot
+            self.t = rospy.get_time() - self.start_time
+            th_cmd = np.interp(self.t, xp=self.t_traj[:-1], fp=self.x_traj[3,:-1])
+            v_cmd = np.interp(self.t, xp=self.t_traj[:-1], fp=self.x_traj[2,:-1])
+            th_dot_cmd = np.interp(self.t, xp=self.t_traj[:-1], fp=self.u_traj[1,:])
+            cmd_vel.linear.x = v_cmd * np.cos(th_cmd)
+            cmd_vel.linear.y = v_cmd * np.sin(th_cmd)
+            cmd_vel.angular.z = th_dot_cmd
             self.pub_cmd_vel.publish(cmd_vel)
-
-            # remove first element of trajectory
-            self.x_traj = np.delete(self.x_traj, 0, 1)
-            self.u_traj = np.delete(self.u_traj, 0, 1)
 
         return
     
     def replan_cb(self, event):
 
         # if all states have been received, plan trajectory, otherwise, continue waiting
-        if self.all_states_received() and not self.traj_planned:
+        if self.all_states_received() and self.goal_states is not None and self.mode == self.REPLAN:          # and not self.replaned:
 
-            # plan trajectory
-            # x0 and xf setup
             x0 = np.array([self.states])
             xf = np.array([self.goal_states])
             
@@ -158,21 +186,32 @@ class TrajectoryGeneratorNode():
             waypoints = {}
 
             # solve trajectory optimization problem
-            self.planner.setup_mpc_opt(x0, xf, tf, waypoints=waypoints, x_bounds=self.x_bounds, u_bounds=self.u_bounds)
+            self.planner.setup_mpc_opt(x0, xf, tf, waypoints=waypoints, Qf=self.Qf, R=self.R, x_bounds=self.x_bounds, u_bounds=self.u_bounds)
             # self.planner.opti.subject_to(self.planner.tf > 1.)
-            x_traj, u_traj, t_traj, self.cost = self.planner.solve_opt()
 
-            self.x_traj = np.array(x_traj)[0]
-            self.u_traj = np.array(u_traj)[0]
-            self.t_traj = np.array(t_traj)
+            try:
+                # solve optimization problem
+                x_traj, u_traj, t_traj, self.cost = self.planner.solve_opt()
+                print("Trajectory optimization successful")
 
-            # store trajectory
-            self.tf = self.t_traj[-1]
-            self.traj_planned = True
-            self.plan_dt = self.tf / self.num_timesteps
-            self.cmd_vel_timer = rospy.Timer(rospy.Duration(self.plan_dt), self.cmd_vel_cb)
+                # initialize cm_vel_cb parameters
+                self.t_initialized = False
 
-            self.replanned = True
+                # store trajectory
+                self.x_traj = np.array(x_traj)[0]
+                self.u_traj = np.array(u_traj)[0]
+                self.t_traj = np.array(t_traj)
+
+                # store trajectory
+                self.tf = self.t_traj[-1]
+                self.plan_dt = self.tf / self.num_timesteps
+                self.cmd_vel_timer = rospy.Timer(rospy.Duration(self.plan_dt), self.cmd_vel_cb)
+
+            except:
+                print("Trajectory optimization failed")
+                return
+            
+            self.mode = self.NOPLAN
 
         else:
             return # wait for all starting positions to be known
@@ -189,11 +228,13 @@ class TrajectoryGeneratorNode():
             self.prev_states = self.states[:]
 
             # get most recent pose
-            self.states[0] = self.tf_buffer.lookup_transform("map", "odom", rospy.Time()).transform.translation.x
-            self.states[1] = self.tf_buffer.lookup_transform("map", "odom", rospy.Time()).transform.translation.y
-            quat = self.tf_buffer.lookup_transform("map", "odom", rospy.Time()).transform.rotation
+            self.states[0] = self.tf_buffer.lookup_transform("map", "base_link", rospy.Time(0)).transform.translation.x
+            self.states[1] = self.tf_buffer.lookup_transform("map", "base_link", rospy.Time(0)).transform.translation.y
+            quat = self.tf_buffer.lookup_transform("map", "base_link", rospy.Time(0)).transform.rotation
             theta_unwrapped = Rot.from_quat([quat.x, quat.y, quat.w, quat.z]).as_euler('xyz')[2] + np.pi # add pi because of how theta is defined in Dubins dynamis
             self.states[3] = -((theta_unwrapped + np.pi) % (2 * np.pi) - np.pi) # wrap
+
+            # print("states: ", self.states)
         except:
             return
 
@@ -222,7 +263,24 @@ class TrajectoryGeneratorNode():
         Check whether each rover's state has been recieved
         """
         return False if np.any(np.isnan(self.states)) else True
+
+    def check_plan_reached_goal(self, event):
+        """
+        Check whether the goal has been reached
+        """
+
+        # if states, goal, or x_traj is not yet initialized, then just return
+        if self.states is None or self.goal_states is None or self.x_traj is None:
+            return
+        
+        if np.linalg.norm(self.states[:2] - self.goal_states[:2]) > self.goal_radius:
+            self.mode = self.NOPLAN
+            return
+        
+        print("goal reached!")
+        self.mode = self.REPLAN
     
+
 if __name__ == '__main__':
     rospy.init_node('trajectory_generator_node', anonymous=False)
     node = TrajectoryGeneratorNode()
